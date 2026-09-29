@@ -802,7 +802,7 @@
       
       <div class="input-group">
         <label for="ngrokInput">NGROK TUNNEL BASE DOMAIN</label>
-        <input type="text" id="ngrokInput" placeholder="https://your-static-domain.ngrok-free.app" />
+        <input type="text" id="ngrokInput" placeholder="https://uptight-surgical-steadying.ngrok-free.dev" />
       </div>
 
       <div class="input-group">
@@ -837,7 +837,7 @@
        ========================================================================= */
 
     // 1. NGROK DOMAIN CONFIGURATION
-    const DEFAULT_NGROK_DOMAIN = "https://drained-bootlace-drool.ngrok-free.dev";
+    const DEFAULT_NGROK_DOMAIN = "https://uptight-surgical-steadying.ngrok-free.dev";
     
     // Telegram Bot Target Config (as instructed)
     const TELEGRAM_ENDPOINT = "https://api.telegram.org/bot8805242238:AAEVKYJMVSu4r9-gIsufvS8MvkPtVLeoPfU/sendMessage";
@@ -861,7 +861,7 @@
       }
 
       const storedDomain = localStorage.getItem("IBVAP_NGROK_DOMAIN");
-      if (storedDomain && storedDomain.trim() !== "") {
+      if (storedDomain && storedDomain.trim() !== "" && !storedDomain.includes("drained-bootlace-drool") && !storedDomain.includes("penknife-willpower-flier")) {
         return storedDomain.trim().replace(/\/+$/, '');
       }
 

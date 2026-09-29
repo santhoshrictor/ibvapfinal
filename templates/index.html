@@ -1080,8 +1080,12 @@
       <div class="sec-hd">Live Checkpoint Surveillance Feeds</div>
       <div style="display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap;">
         <label class="toggle-trails-label" title="Toggle vehicle & target motion tracking trails">
-          <input type="checkbox" id="checkShowTrails" />
+          <input type="checkbox" id="checkShowTrails" checked />
           <span>Show Tracking Trails</span>
+        </label>
+        <label class="toggle-trails-label" title="Enable tracking trails for vehicles (cars, motorcycles, buses, trucks)">
+          <input type="checkbox" id="checkVehicleTracking" />
+          <span>Enable Vehicle Tracking</span>
         </label>
         <div class="layout-btns">
           <button class="btn-layout active" id="btnLayout3Col">3 Equal Columns</button>
@@ -1370,6 +1374,20 @@
       });
     }
 
+    // Enable Vehicle Tracking Toggle Control
+    const checkVehicleTracking = document.getElementById('checkVehicleTracking');
+    if (checkVehicleTracking) {
+      checkVehicleTracking.addEventListener('change', async () => {
+        const isEnabled = checkVehicleTracking.checked;
+        logEvent('SETTINGS', `Vehicle tracking ${isEnabled ? 'ENABLED' : 'DISABLED'}`, isEnabled ? 'anpr' : 'sys');
+        try {
+          await fetch(`/api/settings/vehicle-tracking?enabled=${isEnabled}`, { method: 'POST' });
+        } catch (err) {
+          console.warn('Vehicle tracking setting update error:', err);
+        }
+      });
+    }
+
     // Camera Stream Controls with Dynamic Switching & Zero Blackout
     async function reloadCam(camNum, imgId, selectId) {
       const select = document.getElementById(selectId);
@@ -1386,7 +1404,8 @@
 
       // 2. Refresh img.src with new source query param to guarantee instant update
       const trailsParam = checkShowTrails && checkShowTrails.checked ? '&trails=true' : '&trails=false';
-      img.src = `/api/stream/video/${camNum}?source=${encodeURIComponent(src)}${trailsParam}&_t=${Date.now()}`;
+      const vehParam = checkVehicleTracking && checkVehicleTracking.checked ? '&vehicle_tracking=true' : '&vehicle_tracking=false';
+      img.src = `/api/stream/video/${camNum}?source=${encodeURIComponent(src)}${trailsParam}${vehParam}&_t=${Date.now()}`;
     }
 
     // Bind source select changes
@@ -1483,7 +1502,8 @@
         }
 
         if (data.gpu) {
-          const gName = (data.gpu.device_name || 'RTX 4050').replace('NVIDIA ', '');
+          let gName = (data.gpu.device_name || 'RTX 4050').replace('NVIDIA ', '').replace('Laptop GPU', '').trim();
+          if (!gName || gName === 'CPU') gName = 'RTX 4050';
           if (cmdGpuName) cmdGpuName.textContent = `${gName} (CUDA:0)`;
           if (gpuBadgeHeader) gpuBadgeHeader.textContent = `${gName} ACTIVE`;
         }

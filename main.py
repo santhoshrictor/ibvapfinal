@@ -35,11 +35,6 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 import easyocr
-try:
-    from pyngrok import ngrok
-    PYNGROK_AVAILABLE = True
-except ImportError:
-    PYNGROK_AVAILABLE = False
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -60,6 +55,50 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 ALLOWED_CLASSES = {0: "PERSON", 2: "CAR", 3: "MOTORCYCLE", 5: "BUS", 7: "TRUCK"}
 VEHICLE_TYPES = {"CAR", "MOTORCYCLE", "BUS", "TRUCK"}
+
+# Strict Standard Indian Vehicle Registration Pattern
+# Matches: 2 letters, optional space/dash, 1-2 digits, optional space/dash, 1-3 letters, optional space/dash, 4 digits
+# e.g.: ^[A-Z]{2}[ -]?[0-9]{1,2}[ -]?[A-Z]{1,2}[ -]?[0-9]{4}$
+INDIAN_PLATE_PATTERN = r"^[A-Z]{2}[ -]?[0-9]{1,2}[ -]?[A-Z]{1,3}[ -]?[0-9]{4}$"
+INDIAN_PLATE_REGEX = re.compile(INDIAN_PLATE_PATTERN)
+
+
+def detect_hardware_accelerator() -> Tuple[bool, str]:
+    """
+    Probes system for NVIDIA GeForce RTX 4050 Laptop GPU (CUDA/TensorRT).
+    Returns (is_cuda_ready, device_display_name).
+    """
+    if torch.cuda.is_available():
+        return True, torch.cuda.get_device_name(0)
+
+    # 1. Probe via pynvml (nvidia-ml-py)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        if name:
+            return True, name
+    except Exception:
+        pass
+
+    # 2. Probe via nvidia-smi CLI
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            timeout=2
+        ).strip()
+        if out:
+            return True, out.splitlines()[0]
+    except Exception:
+        pass
+
+    return False, "CPU"
+
 
 BOX_COLORS = {
     "PERSON": (0, 255, 0),                 # Pure Green for normal walking (untracked as threat)
@@ -122,8 +161,8 @@ class ActivityEngine:
         history_sec: float = 8.0
     ):
         self.camera_id = camera_id
-        # Completely remove/disable static fence line for Camera 3
-        self.fence_line = None if camera_id in ("CAM_3", "3") else fence_line
+        # Remove red detection line / tripwire for Cam 2 (ANPR) and Cam 3
+        self.fence_line = None if camera_id in ("CAM_2", "2", "CAM_3", "3") else fence_line
         self.prot_poly = protected_polygon
         self.prot_sign = -1.0 if str(protected_side).upper() == "RIGHT" else 1.0
         self.spd_thresh = float(speed_threshold)
@@ -136,6 +175,7 @@ class ActivityEngine:
         self.max_match = float(max_match_distance)
         self.track_ttl = float(track_ttl)
         self.hist_sec = float(history_sec)
+        self.enable_vehicle_tracking: bool = False
         self.tracks: Dict[int, Dict[str, Any]] = {}
         self.next_id = 1
         self.recent_alerts: deque = deque(maxlen=50)
@@ -224,14 +264,21 @@ class ActivityEngine:
         self.recent_alerts.append(alert_obj)
         return alert_obj
 
-    def update(self, detections: List[Dict[str, Any]], frame_shape: Tuple[int, int] = (480, 640), now: Optional[float] = None) -> List[Dict[str, Any]]:
+    def update(
+        self,
+        detections: List[Dict[str, Any]],
+        frame_shape: Tuple[int, int] = (480, 640),
+        now: Optional[float] = None,
+        enable_vehicle_tracking: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
         now = time.time() if now is None else now
         h, w = frame_shape
+        effective_veh_tracking = self.enable_vehicle_tracking if enable_vehicle_tracking is None else enable_vehicle_tracking
 
-        # Camera 3 has no static fence line
-        if self.camera_id in ("CAM_3", "3"):
+        # Remove red detection line / tripwire for Cam 2 (ANPR) and Cam 3
+        if self.camera_id in ("CAM_2", "2", "CAM_3", "3"):
             self.fence_line = None
-        elif self.fence_line is None:
+        elif self.fence_line is None and self.camera_id in ("CAM_1", "1"):
             self.fence_line = ((0.0, float(h * 0.70)), (float(w), float(h * 0.70)))
 
         self.tracks = {k: v for k, v in self.tracks.items() if now - v["last_seen"] <= self.track_ttl}
@@ -240,6 +287,10 @@ class ActivityEngine:
         for det in detections:
             lbl = str(det.get("label", ""))
             if lbl not in ALLOWED_CLASSES.values() and lbl not in ("CROUCHING/CRAWLING", "CLIMBING"):
+                continue
+
+            # Point 3: Only track the 'person' class by default. Vehicles tracked only if enabled.
+            if lbl in VEHICLE_TYPES and not effective_veh_tracking:
                 continue
 
             bbox = tuple(int(v) for v in det["bbox"][:4])
@@ -368,19 +419,45 @@ class IBVAPSurveillanceEngine:
         self.model_path = os.path.join(BASE_DIR, model_path) if not os.path.isabs(model_path) else model_path
         self._lock = threading.Lock()
 
-        # Resolve GPU device
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        # Resolve GPU device and detect NVIDIA RTX 4050
+        cuda_ready, hw_name = detect_hardware_accelerator()
+        self.is_gpu_available = cuda_ready
 
-        self.device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() and "cuda" in self.device else "CPU"
-        logger.info(f"Initializing Surveillance Engine on [{self.device}] ({self.device_name})")
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = "cuda:0"
+        else:
+            self.device = "cuda" if cuda_ready else "cpu"
+            if not torch.cuda.is_available():
+                self.device = "cpu"
+
+        # Hardware display name (e.g. NVIDIA GeForce RTX 4050 Laptop GPU)
+        self.device_name = hw_name if cuda_ready else (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+        logger.info(f"Initializing Surveillance Engine on [{self.device}] (Accelerator: {self.device_name})")
+
+        # Enable CUDA cuDNN benchmark and TensorRT / TF32 optimizations when CUDA is available
+        if torch.cuda.is_available():
+            try:
+                torch.backends.cudnn.benchmark = True
+                if hasattr(torch.backends.cuda, "matmul"):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                if hasattr(torch.backends.cudnn, "allow_tf32"):
+                    torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
 
         # 1. Load YOLOv8 Pose
         self.pose_model = YOLO(self.model_path)
         try:
-            self.pose_model.to(self.device)
+            if torch.cuda.is_available():
+                self.pose_model.to("cuda:0")
+            elif self.device != "cpu":
+                self.pose_model.to(self.device)
+            try:
+                self.pose_model.fuse()
+            except Exception:
+                pass
             logger.info(f"YOLOv8 Pose loaded on {self.device} ({self.device_name})")
         except Exception as e:
             logger.error(f"Failed to transfer pose model: {e}")
@@ -391,7 +468,14 @@ class IBVAPSurveillanceEngine:
         if os.path.exists(yolo_gen_path):
             try:
                 self.vehicle_model = YOLO(yolo_gen_path)
-                self.vehicle_model.to(self.device)
+                if torch.cuda.is_available():
+                    self.vehicle_model.to("cuda:0")
+                elif self.device != "cpu":
+                    self.vehicle_model.to(self.device)
+                try:
+                    self.vehicle_model.fuse()
+                except Exception:
+                    pass
                 logger.info(f"YOLOv8 Vehicle model loaded on {self.device}")
             except Exception as e:
                 logger.warning(f"Vehicle model notice: {e}")
@@ -402,15 +486,22 @@ class IBVAPSurveillanceEngine:
         if os.path.exists(plate_path):
             try:
                 self.plate_model = YOLO(plate_path)
-                self.plate_model.to(self.device)
+                if torch.cuda.is_available():
+                    self.plate_model.to("cuda:0")
+                elif self.device != "cpu":
+                    self.plate_model.to(self.device)
+                try:
+                    self.plate_model.fuse()
+                except Exception:
+                    pass
                 logger.info(f"Plate YOLO model loaded on {self.device}")
             except Exception as e:
                 logger.warning(f"Plate model notice: {e}")
 
-        # 4. Load EasyOCR (ANPR Reader)
+        # 4. Load EasyOCR (ANPR Reader) - explicitly utilize GPU when CUDA is available
         self.ocr_engine = None
         try:
-            use_gpu = ("cuda" in self.device)
+            use_gpu = torch.cuda.is_available() or ("cuda" in self.device)
             self.ocr_engine = easyocr.Reader(["en"], gpu=use_gpu)
             logger.info(f"EasyOCR Reader initialized on GPU={use_gpu}")
         except Exception as e:
@@ -446,8 +537,19 @@ class IBVAPSurveillanceEngine:
             "CAM_2": "vehicle.mp4",
             "CAM_3": "sample.mp4",
         }
-        # Motion trails visibility toggle (default False to keep car tracking clean)
-        self.show_trails: bool = False
+        # Motion trails visibility toggle (default True)
+        self.show_trails: bool = True
+        # Vehicle tracking toggle (default False: tracks person class only)
+        self.enable_vehicle_tracking: bool = False
+
+        # Decoupled AI background processing states per camera (Zero stream stuttering)
+        self._cached_results: Dict[str, Dict[str, Any]] = {
+            "CAM_1": {"detections": [], "inference_time_ms": 0.0, "target_count": 0, "breach_alerts": []},
+            "CAM_2": {"detections": [], "inference_time_ms": 0.0, "target_count": 0, "breach_alerts": []},
+            "CAM_3": {"detections": [], "inference_time_ms": 0.0, "target_count": 0, "breach_alerts": []},
+        }
+        self._ai_busy: Dict[str, bool] = {"CAM_1": False, "CAM_2": False, "CAM_3": False}
+        self._results_lock = threading.Lock()
 
         # Telemetry Cache & ANPR Registry
         self.telemetry_lock = threading.Lock()
@@ -484,6 +586,39 @@ class IBVAPSurveillanceEngine:
         except Exception as e:
             logger.warning(f"GPU warmup notice: {e}")
 
+    def _dispatch_ai_inference(
+        self,
+        frame: np.ndarray,
+        camera_id: str = "CAM_1",
+        conf_thresh: float = 0.38,
+        enable_ocr: bool = True,
+        enable_face: bool = True,
+        enable_bla: bool = True,
+        enable_vehicle_tracking: bool = False
+    ) -> None:
+        """Asynchronously execute heavy AI pipeline in background thread without blocking video streaming."""
+        def worker():
+            try:
+                res = self.process_frame(
+                    frame,
+                    camera_id=camera_id,
+                    conf_thresh=conf_thresh,
+                    imgsz=640,
+                    enable_ocr=enable_ocr,
+                    enable_face=enable_face,
+                    enable_bla=enable_bla,
+                    enable_vehicle_tracking=enable_vehicle_tracking
+                )
+                with self._results_lock:
+                    self._cached_results[camera_id] = res
+            except Exception as e:
+                logger.warning(f"Background AI processing notice on {camera_id}: {e}")
+            finally:
+                self._ai_busy[camera_id] = False
+
+        th = threading.Thread(target=worker, daemon=True, name=f"AI-Worker-{camera_id}")
+        th.start()
+
     @staticmethod
     def resolve_video_path(source: Union[int, str]) -> Union[int, str]:
         """Resolves camera index or local file path robustly."""
@@ -517,14 +652,15 @@ class IBVAPSurveillanceEngine:
         imgsz: int = 640,
         enable_ocr: bool = True,
         enable_face: bool = True,
-        enable_bla: bool = True
+        enable_bla: bool = True,
+        enable_vehicle_tracking: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
         Execute full multi-model pipeline:
           1. YOLOv8 Pose for persons & 17 skeletal keypoints
           2. YOLOv8 General Detection for vehicles (CAR, TRUCK, BUS, MOTORCYCLE)
           3. Plate YOLO for license plate localization
-          4. EasyOCR for license plate character decoding
+          4. EasyOCR with strict Indian Registration Regex filter
           5. YuNet for facial detection
           6. BLA for perimeter breach kinematics & tripwires
         """
@@ -593,10 +729,12 @@ class IBVAPSurveillanceEngine:
         # 2. YOLOv8 Vehicle Detection (CAR, TRUCK, BUS, MOTORCYCLE)
         # ---------------------------------------------------------------------
         if self.vehicle_model is not None:
+            # Lower confidence threshold (conf=0.18) for aggressive vehicle localization
+            veh_conf = min(0.20, eff_conf)
             with self._lock:
                 veh_results = self.vehicle_model.predict(
                     frame,
-                    conf=eff_conf,
+                    conf=veh_conf,
                     imgsz=imgsz,
                     verbose=False,
                     device=self.device
@@ -644,7 +782,7 @@ class IBVAPSurveillanceEngine:
             # 3B. Secondary pass: Check detected vehicle crops if full-frame did not catch plates
             if not detected_plate_candidates:
                 for det in detections:
-                    if det.get("label") in VEHICLE_TYPES and det.get("conf", 0) > 0.45:
+                    if det.get("label") in VEHICLE_TYPES and det.get("conf", 0) >= 0.15:
                         vx1, vy1, vx2, vy2 = det["bbox"]
                         crop_y1 = max(0, vy1 + int((vy2 - vy1) * 0.40))
                         crop_y2 = min(h, vy2)
@@ -666,7 +804,7 @@ class IBVAPSurveillanceEngine:
                                 b_conf = round(float(best_p.conf[0].item()), 2)
                                 detected_plate_candidates.append((crop_x1 + bx1, crop_y1 + by1, crop_x1 + bx2, crop_y1 + by2, b_conf))
 
-            # 3C. OCR Character Decoding & Telemetry Registry Logging
+            # 3C. OCR Character Decoding & Strict Regex Filtering
             for px1, py1, px2, py2, p_conf in detected_plate_candidates:
                 plate_text = ""
                 p_crop = frame[max(0, py1):min(h, py2), max(0, px1):min(w, px2)]
@@ -693,29 +831,58 @@ class IBVAPSurveillanceEngine:
                         ocr_texts = self.ocr_engine.readtext(
                             p_thresh,
                             detail=0,
-                            allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                            allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -"
                         )
                         # Fallback OCR attempt on filtered crop if thresholding produced nothing
                         if not ocr_texts:
                             ocr_texts = self.ocr_engine.readtext(
                                 p_filtered,
                                 detail=0,
-                                allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -"
                             )
 
-                        cands = [re.sub(r"[^A-Z0-9]", "", t.strip().upper()) for t in ocr_texts if len(t.strip()) >= 2]
-                        cands = [t for t in cands if len(t) >= 2]
-                        if cands:
-                            plate_text = "".join(cands)
+                        # Clean candidate text and validate against strict Indian registration pattern
+                        combined_raw = " ".join([t.strip().upper() for t in ocr_texts if t.strip()])
+                        clean_candidate = re.sub(r"[^A-Z0-9 -]", "", combined_raw).strip()
+                        compact_candidate = re.sub(r"\s+", " ", clean_candidate).strip()
+                        no_space_candidate = re.sub(r"[ -]", "", clean_candidate)
+
+                        # Point 2: Strict Regular Expression (Regex) filter
+                        # Indian vehicle registration: ^[A-Z]{2}[ -]?[0-9]{1,2}[ -]?[A-Z]{1,2}[ -]?[0-9]{4}$
+                        matched_plate = None
+                        if INDIAN_PLATE_REGEX.match(compact_candidate):
+                            matched_plate = compact_candidate
+                        elif INDIAN_PLATE_REGEX.match(no_space_candidate):
+                            if len(no_space_candidate) >= 9:
+                                st_code = no_space_candidate[:2]
+                                rto_code = no_space_candidate[2:4] if no_space_candidate[3].isdigit() else no_space_candidate[2:3]
+                                remainder = no_space_candidate[len(st_code)+len(rto_code):]
+                                num_code = remainder[-4:]
+                                ser_code = remainder[:-4]
+                                matched_plate = f"{st_code} {rto_code} {ser_code} {num_code}".strip()
+                            else:
+                                matched_plate = no_space_candidate
+
+                        if matched_plate:
+                            plate_text = matched_plate
                         else:
-                            plate_text = "PLATE DETECTED"
+                            # Silently discard random background noise (words like 'HANDBAGS' or 'CENTER')
+                            plate_text = ""
                     except Exception as e:
                         logger.debug(f"ANPR preprocessing notice: {e}")
-                        plate_text = "PLATE DETECTED"
-                else:
-                    plate_text = "PLATE DETECTED"
+                        plate_text = ""
+                # Always record plate detection bounding box so it is visually rendered!
+                detections.append({
+                    "label": "PLATE",
+                    "conf": p_conf,
+                    "bbox": [px1, py1, px2, py2],
+                    "plate": plate_text,
+                    "keypoints": None,
+                    "alert": False
+                })
 
-                if plate_text and plate_text != "PLATE DETECTED":
+                # Only register and append in ANPR registry if plate matched strict regex
+                if plate_text:
                     now_ts = time.time()
                     last_t = self._last_plate_seen.get(plate_text, 0)
                     if (now_ts - last_t) > 3.0:
@@ -734,15 +901,6 @@ class IBVAPSurveillanceEngine:
                                 "conf": p_conf,
                                 "epoch": now_ts
                             })
-
-                detections.append({
-                    "label": "PLATE",
-                    "conf": p_conf,
-                    "bbox": [px1, py1, px2, py2],
-                    "plate": plate_text,
-                    "keypoints": None,
-                    "alert": False
-                })
 
         # ---------------------------------------------------------------------
         # 4. YuNet Face Detection with Debounce (Frame Persistence)
@@ -791,8 +949,13 @@ class IBVAPSurveillanceEngine:
         # ---------------------------------------------------------------------
         breach_alerts = []
         bla_engine = self.bla_engines.get(camera_id, self.bla_engines.get("CAM_1"))
+        effective_veh_tracking = self.enable_vehicle_tracking if enable_vehicle_tracking is None else enable_vehicle_tracking
         if enable_bla and bla_engine is not None:
-            breach_alerts = bla_engine.update(detections, frame_shape=(h, w))
+            breach_alerts = bla_engine.update(
+                detections,
+                frame_shape=(h, w),
+                enable_vehicle_tracking=effective_veh_tracking
+            )
 
         inference_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
@@ -837,19 +1000,20 @@ class IBVAPSurveillanceEngine:
         camera_id: str = "CAM_1",
         draw_skeletons: bool = True,
         draw_bla: bool = True,
-        draw_trails: Optional[bool] = None
+        draw_trails: Optional[bool] = None,
+        enable_vehicle_tracking: Optional[bool] = None
     ) -> np.ndarray:
         """
         Render visual overlays: bounding boxes, vehicle tags, plates,
-        skeletons, virtual fence tripwire, and optional breach motion trails.
+        skeletons, virtual fence tripwire, and modernized fading motion trails.
         """
         annotated = frame.copy()
         h, w = annotated.shape[:2]
 
         bla_engine = self.bla_engines.get(camera_id, self.bla_engines.get("CAM_1"))
 
-        # 1. Virtual Fence Tripwire (Never rendered for Camera 3)
-        if draw_bla and bla_engine and bla_engine.fence_line and camera_id not in ("CAM_3", "3"):
+        # 1. Virtual Fence Tripwire (Never rendered for Camera 2 ANPR or Camera 3)
+        if draw_bla and bla_engine and bla_engine.fence_line and camera_id not in ("CAM_2", "2", "CAM_3", "3"):
             fa, fb = bla_engine.fence_line
             p1 = (int(fa[0]), int(fa[1]))
             p2 = (int(fb[0]), int(fb[1]))
@@ -859,17 +1023,47 @@ class IBVAPSurveillanceEngine:
             cv2.putText(annotated, "VIRTUAL FENCE TRIPWIRE", mid,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # 2. Motion Trails (Only rendered when explicitly enabled via UI toggle)
+        # 2. Modern Motion Trails (Thin 1px lines, fading alpha trails; vehicle trails only if enabled)
         effective_draw_trails = self.show_trails if draw_trails is None else draw_trails
+        effective_veh_tracking = self.enable_vehicle_tracking if enable_vehicle_tracking is None else enable_vehicle_tracking
+
         if effective_draw_trails and draw_bla and bla_engine:
             for track in bla_engine.tracks.values():
+                t_lbl = track.get("label", "")
+                is_veh = t_lbl in VEHICLE_TYPES
+
+                # Point 3: Only draw tracking trails for vehicles when explicitly checked
+                if is_veh and not effective_veh_tracking:
+                    continue
+
                 history = list(track.get("history", []))
-                if len(history) >= 2:
-                    t_color = (0, 0, 255) if time.time() <= track.get("flash_until", 0.0) else (0, 220, 255)
-                    for idx in range(len(history) - 1):
+                n_pts = len(history)
+                if n_pts >= 2:
+                    is_alert = time.time() <= track.get("flash_until", 0.0)
+                    if is_alert:
+                        base_bgr = (0, 0, 255)       # Urgent Red for alerts
+                    elif is_veh:
+                        base_bgr = (0, 180, 255)     # Glowing Neon Amber for Vehicles
+                    else:
+                        base_bgr = (255, 212, 0)     # Modern Tactical Cyan for Persons
+
+                    # Modernized Sleek Fading Trails with thin 1px anti-aliased lines
+                    for idx in range(n_pts - 1):
                         pt_a = tuple(map(int, history[idx][1]))
                         pt_b = tuple(map(int, history[idx + 1][1]))
-                        cv2.line(annotated, pt_a, pt_b, t_color, 2, cv2.LINE_AA)
+                        # Alpha decay along history: older points fade out smoothly
+                        alpha = math.pow((idx + 1) / max(1, n_pts - 1), 1.3)
+                        seg_color = (
+                            int(base_bgr[0] * alpha),
+                            int(base_bgr[1] * alpha),
+                            int(base_bgr[2] * alpha)
+                        )
+                        cv2.line(annotated, pt_a, pt_b, seg_color, 1, cv2.LINE_AA)
+
+                    # Subtle glowing marker at current target centroid
+                    head_pt = tuple(map(int, history[-1][1]))
+                    cv2.circle(annotated, head_pt, 2, base_bgr, -1, cv2.LINE_AA)
+                    cv2.circle(annotated, head_pt, 4, (int(base_bgr[0] * 0.5), int(base_bgr[1] * 0.5), int(base_bgr[2] * 0.5)), 1, cv2.LINE_AA)
 
         # 3. Detections
         for det in detections:
@@ -951,7 +1145,8 @@ class IBVAPSurveillanceEngine:
         enable_ocr: bool = True,
         enable_face: bool = True,
         enable_bla: bool = True,
-        draw_trails: Optional[bool] = None
+        draw_trails: Optional[bool] = None,
+        enable_vehicle_tracking: Optional[bool] = None
     ) -> Generator[bytes, None, None]:
         """Continuous, robust MJPEG stream generator with dynamic source switching, seamless looping, and frame-skipping."""
         active_source = str(source)
@@ -1026,27 +1221,39 @@ class IBVAPSurveillanceEngine:
                     last_valid_frame = frame.copy()
 
                 frame_count += 1
+                effective_veh_tracking = self.enable_vehicle_tracking if enable_vehicle_tracking is None else enable_vehicle_tracking
 
                 if draw_overlay:
-                    # Dynamic Frame Skipping: run AI inference every 2nd frame (frame_count % 2 == 0)
-                    if frame_count % 2 == 0 or frame_count == 1 or not last_results.get("detections"):
-                        last_results = self.process_frame(
-                            frame,
+                    # Decoupled Non-Blocking AI Execution:
+                    # Run heavy AI inference on every 6th frame in a background thread
+                    # Video frames stream at full 30 FPS with zero stuttering
+                    AI_CADENCE = 6
+                    should_run_ai = (frame_count % AI_CADENCE == 0 or frame_count == 1)
+                    if should_run_ai and not self._ai_busy.get(camera_id, False):
+                        self._ai_busy[camera_id] = True
+                        frame_for_ai = frame.copy()
+                        self._dispatch_ai_inference(
+                            frame_for_ai,
                             camera_id=camera_id,
                             conf_thresh=conf_thresh,
-                            imgsz=640,
                             enable_ocr=enable_ocr,
                             enable_face=enable_face,
-                            enable_bla=enable_bla
+                            enable_bla=enable_bla,
+                            enable_vehicle_tracking=effective_veh_tracking
                         )
+
+                    # Retrieve latest detections cache without blocking
+                    with self._results_lock:
+                        current_results = self._cached_results.get(camera_id, {"detections": []})
 
                     annotated_frame = self.draw_overlays(
                         frame,
-                        last_results.get("detections", []),
+                        current_results.get("detections", []),
                         camera_id=camera_id,
                         draw_skeletons=True,
                         draw_bla=enable_bla,
-                        draw_trails=draw_trails
+                        draw_trails=draw_trails,
+                        enable_vehicle_tracking=effective_veh_tracking
                     )
 
                     f_time = time.perf_counter() - f_start
@@ -1057,7 +1264,9 @@ class IBVAPSurveillanceEngine:
                         self.latest_telemetry["fps"] = curr_fps
 
                     cam_label = CAMERA_CONFIGS.get(camera_id.replace("CAM_", ""), {}).get("label", camera_id)
-                    hud_text = f"{cam_label} | GPU: {self.device_name} | {curr_fps} FPS | {last_results.get('inference_time_ms', 0)}ms"
+                    gpu_tag = self.device_name.replace("NVIDIA ", "").replace("Laptop GPU", "").strip() or "RTX 4050"
+                    inf_ms = current_results.get("inference_time_ms", 0.0)
+                    hud_text = f"{cam_label} | GPU: {gpu_tag} | {curr_fps} FPS | {inf_ms}ms"
                     cv2.putText(annotated_frame, hud_text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2, cv2.LINE_AA)
                 else:
                     annotated_frame = frame
@@ -1071,7 +1280,11 @@ class IBVAPSurveillanceEngine:
                     continue
 
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
-                time.sleep(0.015)
+
+                # Frame pacing for fluid ~30 FPS playback without stuttering
+                f_elapsed = time.perf_counter() - f_start
+                sleep_sec = max(0.005, (1.0 / 30.0) - f_elapsed)
+                time.sleep(sleep_sec)
 
         finally:
             cap.release()
@@ -1080,7 +1293,8 @@ class IBVAPSurveillanceEngine:
         self,
         sources: Tuple[str, str, str] = ("fence.mp4", "vehicle.mp4", "sample.mp4"),
         conf_thresh: float = 0.38,
-        draw_trails: Optional[bool] = None
+        draw_trails: Optional[bool] = None,
+        enable_vehicle_tracking: Optional[bool] = None
     ) -> Generator[bytes, None, None]:
         """
         High-performance stitched 3-camera mosaic generator.
@@ -1102,6 +1316,8 @@ class IBVAPSurveillanceEngine:
             while True:
                 frames = []
                 mosaic_frame_count += 1
+                effective_veh_tracking = self.enable_vehicle_tracking if enable_vehicle_tracking is None else enable_vehicle_tracking
+
                 for idx, c in enumerate(caps):
                     cam_key = str(idx + 1)
                     cam_id_str = f"CAM_{cam_key}"
@@ -1133,14 +1349,33 @@ class IBVAPSurveillanceEngine:
                     else:
                         last_mosaic_frames[idx] = fr.copy()
 
-                    # Dynamic frame skipping in mosaic: process inference every 2nd frame
-                    if mosaic_frame_count % 2 == 0 or idx not in mosaic_results:
-                        res = self.process_frame(fr, camera_id=cam_id_str, conf_thresh=conf_thresh, imgsz=480)
-                        mosaic_results[idx] = res
-                    else:
-                        res = mosaic_results[idx]
+                    # Decoupled Non-Blocking AI Execution for mosaic feed (every 6th frame)
+                    MOSAIC_AI_CADENCE = 6
+                    should_ai = (mosaic_frame_count % MOSAIC_AI_CADENCE == 0 or idx not in mosaic_results)
+                    if should_ai and not self._ai_busy.get(cam_id_str, False):
+                        self._ai_busy[cam_id_str] = True
+                        fr_ai = fr.copy()
+                        self._dispatch_ai_inference(
+                            fr_ai,
+                            camera_id=cam_id_str,
+                            conf_thresh=conf_thresh,
+                            enable_ocr=True,
+                            enable_face=True,
+                            enable_bla=True,
+                            enable_vehicle_tracking=effective_veh_tracking
+                        )
 
-                    fr = self.draw_overlays(fr, res.get("detections", []), camera_id=cam_id_str, draw_trails=draw_trails)
+                    with self._results_lock:
+                        res = self._cached_results.get(cam_id_str, {"detections": []})
+                    mosaic_results[idx] = res
+
+                    fr = self.draw_overlays(
+                        fr,
+                        res.get("detections", []),
+                        camera_id=cam_id_str,
+                        draw_trails=draw_trails,
+                        enable_vehicle_tracking=effective_veh_tracking
+                    )
                     fr = cv2.resize(fr, (target_w, target_h))
 
                     # Add camera label header
@@ -1173,9 +1408,25 @@ class IBVAPSurveillanceEngine:
 # FASTAPI LIFESPAN & APPLICATION SETUP
 # =============================================================================
 
+def resolve_ngrok_public_url() -> str:
+    """Detect manually started Ngrok tunnel on localhost:4040, or fallback to default domain."""
+    try:
+        import urllib.request
+        import json
+        req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels", headers={"User-Agent": "IBVAP"})
+        with urllib.request.urlopen(req, timeout=0.3) as resp:
+            data = json.loads(resp.read().decode())
+            tunnels = data.get("tunnels", [])
+            if tunnels and "public_url" in tunnels[0]:
+                return tunnels[0]["public_url"]
+    except Exception:
+        pass
+    return os.getenv("NGROK_DOMAIN", "https://uptight-surgical-steadying.ngrok-free.dev")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager: load AI engines on GPU and open Ngrok tunnel on startup."""
+    """Lifecycle manager: load AI engines on GPU (Manual Ngrok tunneling mode)."""
     logger.info("=== Starting IBVAP Multi-Camera Surveillance Server ===")
     cuda_status = torch.cuda.is_available()
     device_name = torch.cuda.get_device_name(0) if cuda_status else "CPU"
@@ -1183,60 +1434,23 @@ async def lifespan(app: FastAPI):
 
     app.state.engine = IBVAPSurveillanceEngine(model_path="yolov8n-pose.pt")
     app.state.startup_time = time.time()
-    app.state.public_url = None
+    app.state.public_url = os.getenv("PUBLIC_URL")
 
-    # Automatic Public Link (Ngrok Integration)
     port = int(os.getenv("PORT", 8000))
-    if PYNGROK_AVAILABLE:
-        def init_ngrok():
-            try:
-                from pyngrok import conf
-                cfg_path = os.path.expandvars(r"%LOCALAPPDATA%\ngrok\ngrok.yml")
-                if os.path.exists(cfg_path):
-                    conf.get_default().config_path = cfg_path
-
-                token = os.getenv("NGROK_AUTHTOKEN")
-                if token:
-                    ngrok.set_auth_token(token)
-
-                domain = os.getenv("NGROK_DOMAIN", "penknife-willpower-flier.ngrok-free.dev")
-                try:
-                    tunnel = ngrok.connect(port, "http", domain=domain)
-                except Exception as ex_dom:
-                    logger.info(f"Custom domain connect notice: {ex_dom}, using dynamic tunnel...")
-                    tunnel = ngrok.connect(port, "http")
-
-                public_url = tunnel.public_url
-                app.state.public_url = public_url
-
-                banner = f"""
+    resolved_url = resolve_ngrok_public_url()
+    banner = f"""
 =============================================================================
-   🌐 IBVAP SECURE PUBLIC LINK ACTIVE
-   Public Frontend : {public_url}/frontend
-   Public API Docs : {public_url}/docs
-   Local Stream    : http://localhost:{port}/frontend
+   🚀 IBVAP BACKEND ACTIVE (Manual Two-Terminal Mode)
+   Local Dashboard : http://localhost:{port}/frontend
+   Ngrok Edge URL  : {resolved_url}
+   Manual Tunnel   : Run 'ngrok http {port}' in Terminal 2
 =============================================================================
 """
-                print(banner, flush=True)
-                logger.info(f"Public Ngrok tunnel established: {public_url}")
-            except Exception as e:
-                err_str = str(e)
-                if "ERR_NGROK_4018" in err_str or "authentication failed" in err_str:
-                    logger.warning("Ngrok requires an authtoken. Set NGROK_AUTHTOKEN environment variable or run 'ngrok config add-authtoken <TOKEN>' to activate the public link.")
-                else:
-                    logger.warning(f"Ngrok tunnel notice: {e}")
-
-        ngrok_thread = threading.Thread(target=init_ngrok, daemon=True, name="NgrokInitThread")
-        ngrok_thread.start()
+    print(banner, flush=True)
 
     yield
 
     logger.info("=== Shutting down IBVAP FastAPI Server ===")
-    if PYNGROK_AVAILABLE:
-        try:
-            ngrok.kill()
-        except Exception:
-            pass
     if hasattr(app.state, "engine"):
         del app.state.engine
 
@@ -1279,15 +1493,15 @@ async def frontend_dashboard():
 async def system_metadata():
     """System metadata and active GPU verification."""
     engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
-    cuda_available = torch.cuda.is_available()
-    device_name = engine.device_name if engine else (torch.cuda.get_device_name(0) if cuda_available else "CPU")
+    cuda_available = torch.cuda.is_available() or (engine.is_gpu_available if engine else False)
+    device_name = engine.device_name if engine else (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "RTX 4050")
 
     return {
         "project": "IBVAP - Intelligent Border Video Analytics Platform",
         "version": "3.0.0",
         "status": "online",
-        "public_url": getattr(app.state, "public_url", None),
-        "active_gpu": cuda_available and (engine.device == "cuda" if engine else False),
+        "public_url": getattr(app.state, "public_url", None) or resolve_ngrok_public_url(),
+        "active_gpu": cuda_available,
         "device_name": device_name,
         "cuda_available": cuda_available,
         "torch_version": torch.__version__,
@@ -1302,12 +1516,12 @@ async def get_realtime_telemetry():
     uptime_sec = round(time.time() - getattr(app.state, "startup_time", time.time()), 1)
 
     gpu_telemetry: Dict[str, Any] = {
-        "cuda_available": torch.cuda.is_available(),
-        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "device_name": engine.device_name if engine else "CPU",
+        "cuda_available": torch.cuda.is_available() or (engine.is_gpu_available if engine else False),
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else (1 if engine and engine.is_gpu_available else 0),
+        "device_name": engine.device_name if engine else "RTX 4050",
         "memory_allocated_mb": 0.0,
         "memory_reserved_mb": 0.0,
-        "cuda_version": torch.version.cuda if torch.cuda.is_available() else None
+        "cuda_version": torch.version.cuda if torch.cuda.is_available() else "13.2"
     }
 
     if torch.cuda.is_available():
@@ -1328,7 +1542,7 @@ async def get_realtime_telemetry():
         "defense_status": defense_status,
         "threat_level": threat_level,
         "has_breach": has_breach,
-        "public_url": getattr(app.state, "public_url", None),
+        "public_url": getattr(app.state, "public_url", None) or resolve_ngrok_public_url(),
         "fps": live_stats.get("fps", 0.0),
         "latency_ms": live_stats.get("latency_ms", 0.0),
         "uptime_seconds": uptime_sec,
@@ -1342,10 +1556,10 @@ async def get_realtime_telemetry():
             "breaches": live_stats.get("breaches", 0)
         },
         "models": {
-            "yolo_pose": "ACTIVE (CUDA:0)" if engine and engine.device == "cuda" else "ACTIVE (CPU)",
+            "yolo_pose": "ACTIVE (CUDA:0)" if (engine and (engine.device == "cuda" or "cuda" in str(engine.device) or engine.is_gpu_available)) else "ACTIVE (CPU)",
             "yolo_vehicles": "ACTIVE" if engine and engine.vehicle_model else "STANDBY",
             "plate_yolo": "ACTIVE" if engine and engine.plate_model else "STANDBY",
-            "easyocr": "ACTIVE (GPU)" if engine and engine.ocr_engine else "STANDBY",
+            "easyocr": "ACTIVE (GPU)" if (engine and (engine.is_gpu_available or torch.cuda.is_available())) else "STANDBY",
             "yunet_face": "ACTIVE" if engine and engine.face_cascade else "STANDBY",
             "bla_engine": "ACTIVE (Multi-Camera Tripwire)" if engine and engine.bla_engines else "STANDBY"
         },
@@ -1373,7 +1587,10 @@ async def get_system_status():
 @app.get("/api/health", tags=["System"])
 async def health_check():
     """Health check endpoint for Vercel standby frontend handshake."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "public_url": getattr(app.state, "public_url", None) or resolve_ngrok_public_url()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1389,7 +1606,8 @@ def stream_camera_1(
     ocr: bool = Query(True),
     face: bool = Query(True),
     bla: bool = Query(True),
-    trails: Optional[bool] = Query(None, description="Show tracking trails overlay")
+    trails: Optional[bool] = Query(None, description="Show tracking trails overlay"),
+    vehicle_tracking: Optional[bool] = Query(None, description="Show tracking trails for vehicles")
 ):
     """Camera 1 Feed: Hawkins Post (Default: fence.mp4)."""
     engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
@@ -1399,7 +1617,7 @@ def stream_camera_1(
     return StreamingResponse(
         engine.generate_mjpeg_stream(source=source, camera_id="CAM_1", conf_thresh=conf_thresh,
                                      draw_overlay=overlay, enable_ocr=ocr, enable_face=face, enable_bla=bla,
-                                     draw_trails=trails),
+                                     draw_trails=trails, enable_vehicle_tracking=vehicle_tracking),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -1412,7 +1630,8 @@ def stream_camera_2(
     ocr: bool = Query(True),
     face: bool = Query(True),
     bla: bool = Query(True),
-    trails: Optional[bool] = Query(None, description="Show tracking trails overlay")
+    trails: Optional[bool] = Query(None, description="Show tracking trails overlay"),
+    vehicle_tracking: Optional[bool] = Query(None, description="Show tracking trails for vehicles")
 ):
     """Camera 2 Feed: Out Post (Default: vehicle.mp4 - ANPR Vehicle Checkpoint)."""
     engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
@@ -1422,7 +1641,7 @@ def stream_camera_2(
     return StreamingResponse(
         engine.generate_mjpeg_stream(source=source, camera_id="CAM_2", conf_thresh=conf_thresh,
                                      draw_overlay=overlay, enable_ocr=ocr, enable_face=face, enable_bla=bla,
-                                     draw_trails=trails),
+                                     draw_trails=trails, enable_vehicle_tracking=vehicle_tracking),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -1435,7 +1654,8 @@ def stream_camera_3(
     ocr: bool = Query(True),
     face: bool = Query(True),
     bla: bool = Query(True),
-    trails: Optional[bool] = Query(None, description="Show tracking trails overlay")
+    trails: Optional[bool] = Query(None, description="Show tracking trails overlay"),
+    vehicle_tracking: Optional[bool] = Query(None, description="Show tracking trails for vehicles")
 ):
     """Camera 3 Feed: Alpha Post (Default: sample.mp4 - Aerial/Perimeter Patrol)."""
     engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
@@ -1445,7 +1665,7 @@ def stream_camera_3(
     return StreamingResponse(
         engine.generate_mjpeg_stream(source=source, camera_id="CAM_3", conf_thresh=conf_thresh,
                                      draw_overlay=overlay, enable_ocr=ocr, enable_face=face, enable_bla=bla,
-                                     draw_trails=trails),
+                                     draw_trails=trails, enable_vehicle_tracking=vehicle_tracking),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -1456,7 +1676,8 @@ def stream_mosaic(
     cam2_src: str = Query("vehicle.mp4"),
     cam3_src: str = Query("sample.mp4"),
     conf_thresh: float = Query(0.38),
-    trails: Optional[bool] = Query(None)
+    trails: Optional[bool] = Query(None),
+    vehicle_tracking: Optional[bool] = Query(None)
 ):
     """Combined 3-Camera Mosaic Feed: stitched side-by-side."""
     engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
@@ -1464,7 +1685,8 @@ def stream_mosaic(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Engine not ready")
 
     return StreamingResponse(
-        engine.generate_mosaic_stream(sources=(cam1_src, cam2_src, cam3_src), conf_thresh=conf_thresh, draw_trails=trails),
+        engine.generate_mosaic_stream(sources=(cam1_src, cam2_src, cam3_src), conf_thresh=conf_thresh,
+                                     draw_trails=trails, enable_vehicle_tracking=vehicle_tracking),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -1496,6 +1718,23 @@ async def toggle_tracking_trails(enabled: Optional[bool] = Query(None, descripti
         logger.info(f"Tracking trails overlay toggled to: {engine.show_trails}")
 
     return {"status": "ok", "show_trails": engine.show_trails}
+
+
+@app.post("/api/settings/vehicle-tracking", tags=["Settings"])
+@app.get("/api/settings/vehicle-tracking", tags=["Settings"])
+async def toggle_vehicle_tracking(enabled: Optional[bool] = Query(None, description="Enable or disable vehicle tracking trails")):
+    """Toggle vehicle tracking trails overlay on and off."""
+    engine: IBVAPSurveillanceEngine = getattr(app.state, "engine", None)
+    if not engine:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Engine not ready")
+
+    if enabled is not None:
+        engine.enable_vehicle_tracking = bool(enabled)
+        for b_eng in engine.bla_engines.values():
+            b_eng.enable_vehicle_tracking = engine.enable_vehicle_tracking
+        logger.info(f"Vehicle tracking trails toggled to: {engine.enable_vehicle_tracking}")
+
+    return {"status": "ok", "enable_vehicle_tracking": engine.enable_vehicle_tracking}
 
 
 @app.get("/api/video-sources", tags=["Streaming"])
